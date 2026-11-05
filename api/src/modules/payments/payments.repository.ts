@@ -1,0 +1,62 @@
+import type { D1Database } from "@cloudflare/workers-types";
+import type { BillShare } from "../../shared/types";
+
+export class PaymentsRepository {
+  constructor(private readonly db: D1Database) {}
+
+  async findShare(
+    billId: string,
+    shareId: string,
+  ): Promise<BillShare | null> {
+    return this.db
+      .prepare(
+        `SELECT
+           s.id,
+           s.bill_id,
+           s.member_id,
+           s.amount_cents,
+           s.paid_at,
+           s.idempotency_key
+         FROM bill_shares s
+         INNER JOIN bills b ON b.id = s.bill_id
+         WHERE b.id = ?
+           AND s.id = ?`,
+      )
+      .bind(billId, shareId)
+      .first<BillShare>();
+  }
+
+  async markAsPaid(
+    shareId: string,
+    idempotencyKey: string,
+    paidAt: string,
+  ): Promise<BillShare | null> {
+    // This is an atomic conditional update.
+    await this.db
+      .prepare(
+        `UPDATE bill_shares
+         SET
+           paid_at = ?,
+           idempotency_key = ?
+         WHERE id = ?
+           AND paid_at IS NULL`,
+      )
+      .bind(paidAt, idempotencyKey, shareId)
+      .run();
+
+    return this.db
+      .prepare(
+        `SELECT
+           id,
+           bill_id,
+           member_id,
+           amount_cents,
+           paid_at,
+           idempotency_key
+         FROM bill_shares
+         WHERE id = ?`,
+      )
+      .bind(shareId)
+      .first<BillShare>();
+  }
+}
