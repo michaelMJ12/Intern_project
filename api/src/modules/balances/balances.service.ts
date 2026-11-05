@@ -7,9 +7,7 @@ export class BalancesService {
 
   async getBalances(homeId: string): Promise<Balance[]> {
     const home = await this.db
-      .prepare(
-        "SELECT id FROM homes WHERE id = ?",
-      )
+      .prepare("SELECT id FROM homes WHERE id = ?")
       .bind(homeId)
       .first<{ id: string }>();
 
@@ -35,9 +33,6 @@ export class BalancesService {
          FROM members m
          LEFT JOIN bill_shares s
            ON s.member_id = m.id
-         LEFT JOIN bills b
-           ON b.id = s.bill_id
-           AND b.home_id = m.home_id
          WHERE m.home_id = ?
          GROUP BY m.id, m.name, m.position
          ORDER BY m.position ASC`,

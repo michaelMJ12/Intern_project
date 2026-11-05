@@ -1,9 +1,38 @@
-import type { D1Database } from "@cloudflare/workers-types";
+import type {
+  D1Database,
+  D1PreparedStatement,
+} from "@cloudflare/workers-types";
+import { AppError } from "../../shared/errors";
+
 import type {
   Bill,
   BillResponse,
   Member,
 } from "../../shared/types";
+import { buildIdempotencyStatement, type IdempotencyContext } from "../../shared/idempotency";
+
+interface ShareRow {
+  id: string;
+  bill_id: string;
+  member_id: string;
+  amount_cents: number;
+  paid_at: string | null;
+}
+
+function toBillResponse(bill: Bill, shares: ShareRow[]): BillResponse {
+  return {
+    id: bill.id,
+    homeId: bill.home_id,
+    title: bill.title,
+    totalCents: bill.total_cents,
+    shares: shares.map((share) => ({
+      id: share.id,
+      memberId: share.member_id,
+      amountCents: share.amount_cents,
+      paidAt: share.paid_at,
+    })),
+  };
+}
 
 export class BillsRepository {
   constructor(private readonly db: D1Database) {}
@@ -34,16 +63,35 @@ export class BillsRepository {
     title: string,
     totalCents: number,
     members: Member[],
+    idempotency?: IdempotencyContext,
   ): Promise<BillResponse> {
+    if (members.length === 0) {
+      throw new AppError(
+        422,
+        "Cannot create a bill for a home without members",
+      );
+    }
+
     const billId = crypto.randomUUID();
 
-    const baseAmount = Math.floor(
-      totalCents / members.length,
-    );
-
+    const baseAmount = Math.floor(totalCents / members.length);
     const remainder = totalCents % members.length;
 
-    const statements = [
+    const allocations = members.map((member, index) => ({
+      memberId: member.id,
+      amountCents: baseAmount + (index < remainder ? 1 : 0),
+    }));
+
+    const allocated = allocations.reduce(
+      (sum, allocation) => sum + allocation.amountCents,
+      0,
+    );
+
+    if (allocated !== totalCents) {
+      throw new Error("Share allocation does not match the bill total");
+    }
+
+    const statements: D1PreparedStatement[] = [
       this.db
         .prepare(
           `INSERT INTO bills (
@@ -52,15 +100,22 @@ export class BillsRepository {
              title,
              total_cents
            )
-           VALUES (?, ?, ?, ?)`,
+           SELECT ?, ?, ?, ?
+           WHERE (
+             SELECT COUNT(*) FROM members WHERE home_id = ?
+           ) = ?`,
         )
-        .bind(billId, homeId, title, totalCents),
+        .bind(
+          billId,
+          homeId,
+          title,
+          totalCents,
+          homeId,
+          members.length,
+        ),
 
-      ...members.map((member, index) => {
-        const amountCents =
-          baseAmount + (index < remainder ? 1 : 0);
-
-        return this.db
+      ...allocations.map((allocation) =>
+        this.db
           .prepare(
             `INSERT INTO bill_shares (
                id,
@@ -68,24 +123,40 @@ export class BillsRepository {
                member_id,
                amount_cents
              )
-             VALUES (?, ?, ?, ?)`,
+             SELECT ?, ?, ?, ?
+             WHERE EXISTS (SELECT 1 FROM bills WHERE id = ?)`,
           )
           .bind(
             crypto.randomUUID(),
             billId,
-            member.id,
-            amountCents,
-          );
-      }),
+            allocation.memberId,
+            allocation.amountCents,
+            billId,
+          ),
+      ),
     ];
 
-    // D1 batch executes the statements atomically.
-    await this.db.batch(statements);
+    if (idempotency) {
+      statements.push(
+        buildIdempotencyStatement(
+          this.db,
+          idempotency,
+          billId,
+          "bills",
+        ),
+      );
+    }
 
-    const createdBill = await this.getBillById(
-      homeId,
-      billId,
-    );
+    const results = await this.db.batch(statements);
+
+    if ((results[0]?.meta.changes ?? 0) !== 1) {
+      throw new AppError(
+        409,
+        "Household members changed while the bill was being created. Please try again.",
+      );
+    }
+
+    const createdBill = await this.getBillById(homeId, billId);
 
     if (!createdBill) {
       throw new Error("Failed to retrieve created bill");
@@ -115,6 +186,7 @@ export class BillsRepository {
       .prepare(
         `SELECT
            s.id,
+           s.bill_id,
            s.member_id,
            s.amount_cents,
            s.paid_at
@@ -124,77 +196,52 @@ export class BillsRepository {
          ORDER BY m.position ASC`,
       )
       .bind(billId)
-      .all<{
-        id: string;
-        member_id: string;
-        amount_cents: number;
-        paid_at: string | null;
-      }>();
+      .all<ShareRow>();
 
-    return {
-      id: bill.id,
-      homeId: bill.home_id,
-      title: bill.title,
-      totalCents: bill.total_cents,
-      shares: shares.results.map((share) => ({
-        id: share.id,
-        memberId: share.member_id,
-        amountCents: share.amount_cents,
-        paidAt: share.paid_at,
-      })),
-    };
+    return toBillResponse(bill, shares.results);
   }
 
-  async getBillsByHome(
-    homeId: string,
-  ): Promise<BillResponse[]> {
+  async getBillsByHome(homeId: string): Promise<BillResponse[]> {
     const bills = await this.db
       .prepare(
         `SELECT id, home_id, title, total_cents
          FROM bills
          WHERE home_id = ?
-         ORDER BY created_at DESC`,
+         ORDER BY created_at DESC, id DESC`,
       )
       .bind(homeId)
       .all<Bill>();
+    const shares = await this.db
+      .prepare(
+        `SELECT
+           s.id,
+           s.bill_id,
+           s.member_id,
+           s.amount_cents,
+           s.paid_at
+         FROM bill_shares s
+         JOIN bills b ON b.id = s.bill_id
+         JOIN members m ON m.id = s.member_id
+         WHERE b.home_id = ?
+         ORDER BY m.position ASC`,
+      )
+      .bind(homeId)
+      .all<ShareRow>();
 
-    const responses: BillResponse[] = [];
+    const sharesByBill = new Map<string, ShareRow[]>();
 
-    for (const bill of bills.results) {
-      const shares = await this.db
-        .prepare(
-          `SELECT
-             s.id,
-             s.member_id,
-             s.amount_cents,
-             s.paid_at
-           FROM bill_shares s
-           JOIN members m ON m.id = s.member_id
-           WHERE s.bill_id = ?
-           ORDER BY m.position ASC`,
-        )
-        .bind(bill.id)
-        .all<{
-          id: string;
-          member_id: string;
-          amount_cents: number;
-          paid_at: string | null;
-        }>();
+    for (const share of shares.results) {
+      const group = sharesByBill.get(share.bill_id);
 
-      responses.push({
-        id: bill.id,
-        homeId: bill.home_id,
-        title: bill.title,
-        totalCents: bill.total_cents,
-        shares: shares.results.map((share) => ({
-          id: share.id,
-          memberId: share.member_id,
-          amountCents: share.amount_cents,
-          paidAt: share.paid_at,
-        })),
-      });
+      if (group) {
+        group.push(share);
+      } else {
+        sharesByBill.set(share.bill_id, [share]);
+      }
     }
 
-    return responses;
+    return bills.results.map((bill) =>
+      toBillResponse(bill, sharesByBill.get(bill.id) ?? []),
+    );
   }
 }

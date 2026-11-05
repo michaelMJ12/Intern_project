@@ -3,6 +3,7 @@ import { useRef, useState } from "react";
 import type { FormEvent } from "react";
 
 const API_BASE = "http://127.0.0.1:8787/api";
+const REQUEST_TIMEOUT_MS = 15000;
 
 interface Home {
   id: string;
@@ -40,36 +41,75 @@ interface BalancesResponse {
   balances: Balance[];
 }
 
+/**
+ * Safely reads an error message from an unknown JSON body.
+ * Accepts { error: string } or { message: string }.
+ */
+function extractErrorMessage(data: unknown): string | null {
+  if (typeof data !== "object" || data === null) {
+    return null;
+  }
+
+  const record = data as Record<string, unknown>;
+  const candidate = record["error"] ?? record["message"];
+
+  return typeof candidate === "string" && candidate.length > 0
+    ? candidate
+    : null;
+}
+
 async function apiRequest<T>(
   path: string,
   options: RequestInit = {},
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
 ): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  const responseText = await response.text();
-  let data: any = {};
+  try {
+    let response: Response;
 
-  if (responseText) {
     try {
-      data = JSON.parse(responseText);
-    } catch {
-      throw new Error("The server returned an invalid response.");
+      response = await fetch(`${API_BASE}${path}`, {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          "Content-Type": "application/json",
+          ...options.headers,
+        },
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        // The server may still have processed the request. Callers keep their
+        // idempotency key so a retry cannot create a duplicate.
+        throw new Error(
+          "The request timed out. Please try again; it will not be applied twice.",
+        );
+      }
+      throw new Error("Unable to reach the server. Check your connection.");
     }
-  }
 
-  if (!response.ok) {
-    throw new Error(
-      data.error || data.message || `Request failed (${response.status})`,
-    );
-  }
+    const responseText = await response.text();
+    let data: unknown = {};
 
-  return data as T;
+    if (responseText) {
+      try {
+        data = JSON.parse(responseText);
+      } catch {
+        throw new Error("The server returned an invalid response.");
+      }
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        extractErrorMessage(data) ?? `Request failed (${response.status})`,
+      );
+    }
+
+    return data as T;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function formatMoney(amountCents: number): string {
@@ -77,6 +117,43 @@ function formatMoney(amountCents: number): string {
     style: "currency",
     currency: "NGN",
   }).format(amountCents / 100);
+}
+
+/**
+ * Strictly converts a user-typed naira amount to integer kobo.
+ * Rejects (instead of silently rounding) anything with more than two decimals,
+ * negatives, exponents, or non-numeric input. Avoids float multiplication.
+ */
+function parseAmountToCents(
+  input: string,
+): { cents: number } | { error: string } {
+  const value = input.trim().replace(/,/g, "");
+
+  if (!value) {
+    return { error: "Enter a bill amount." };
+  }
+
+  if (!/^\d+(\.\d+)?$/.test(value)) {
+    return { error: "Enter a valid amount using digits only, e.g. 15000.50." };
+  }
+
+  const [whole = "", fraction = ""] = value.split(".");
+
+  if (fraction.length > 2) {
+    return { error: "Amount can have at most 2 decimal places." };
+  }
+
+  if (whole.length > 12) {
+    return { error: "Amount is too large." };
+  }
+
+  const cents = Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
+
+  if (!Number.isSafeInteger(cents) || cents <= 0) {
+    return { error: "Amount must be greater than zero." };
+  }
+
+  return { cents };
 }
 
 export const Route = createFileRoute("/")({
@@ -97,33 +174,89 @@ function HomePage() {
   const [billAmount, setBillAmount] = useState("");
 
   const [loading, setLoading] = useState(false);
-  const [payingShareId, setPayingShareId] = useState<string | null>(null);
+  // A Set so several members can pay at the same time.
+  const [payingShareIds, setPayingShareIds] = useState<Set<string>>(
+    new Set(),
+  );
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
-  // Keep the same idempotency key when retrying a failed payment.
+  // Idempotency keys survive failed/timed-out attempts so a retry reuses them.
   const paymentKeys = useRef(new Map<string, string>());
+  const mutationKeys = useRef(new Map<string, string>());
+
+  // Synchronous guards: React state updates are async, so two fast clicks can
+  // both see "not busy" if we rely on state alone.
+  const inFlightPayments = useRef(new Set<string>());
+  const busyRef = useRef(false);
+
+  // Incremented whenever the active home changes so late responses from a
+  // previous home are ignored.
+  const sessionRef = useRef(0);
 
   const clearMessages = () => {
     setError("");
     setSuccess("");
   };
 
+  const getMutationKey = (scope: string): string => {
+    let key = mutationKeys.current.get(scope);
+    if (!key) {
+      key = `mutation-${crypto.randomUUID()}`;
+      mutationKeys.current.set(scope, key);
+    }
+    return key;
+  };
+
+  // Runs a form action once at a time (blocks double submit, incl. Enter key).
+  const runExclusive = async (action: () => Promise<void>) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setLoading(true);
+    try {
+      await action();
+    } finally {
+      busyRef.current = false;
+      setLoading(false);
+    }
+  };
+
   // GET /homes/:homeId/balances
-  const loadBalances = async (homeId: string) => {
+  const loadBalances = async (homeId: string, session: number) => {
     const result = await apiRequest<BalancesResponse>(
       `/homes/${homeId}/balances`,
     );
 
-    setBalances(result.balances ?? []);
-    return result.balances ?? [];
+    const next = result.balances ?? [];
+    if (session === sessionRef.current) {
+      setBalances(next);
+    }
+    return next;
+  };
+
+  // Refresh after a successful write. A refresh failure must NOT be reported
+  // as if the write itself failed.
+  const refreshBalancesSafely = async (homeId: string, session: number) => {
+    try {
+      await loadBalances(homeId, session);
+      return true;
+    } catch {
+      if (session === sessionRef.current) {
+        setError(
+          "Saved, but balances could not be refreshed. Use \"Refresh balances\".",
+        );
+      }
+      return false;
+    }
   };
 
   const resetHomeData = () => {
+    sessionRef.current += 1;
     setMembers([]);
     setBills([]);
     setBalances([]);
     paymentKeys.current.clear();
+    mutationKeys.current.clear();
   };
 
   // POST /homes
@@ -138,25 +271,32 @@ function HomePage() {
       return;
     }
 
-    setLoading(true);
-
-    try {
-      const home = await apiRequest<Home>("/homes", {
-        method: "POST",
-        body: JSON.stringify({ name }),
-      });
-
-      resetHomeData();
-      setActiveHome(home);
-      setHomeIdInput(home.id);
-      setHomeName("");
-
-      setSuccess(`Home "${home.name}" was created successfully.`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to create home.");
-    } finally {
-      setLoading(false);
+    if (name.length > 100) {
+      setError("Home name must be 100 characters or fewer.");
+      return;
     }
+
+    await runExclusive(async () => {
+      const key = getMutationKey(`home:${name.toLowerCase()}`);
+
+      try {
+        const home = await apiRequest<Home>("/homes", {
+          method: "POST",
+          headers: { "Idempotency-Key": key },
+          body: JSON.stringify({ name }),
+        });
+
+        mutationKeys.current.delete(`home:${name.toLowerCase()}`);
+        resetHomeData();
+        setActiveHome(home);
+        setHomeIdInput(home.id);
+        setHomeName("");
+
+        setSuccess(`Home "${home.name}" was created successfully.`);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Unable to create home.");
+      }
+    });
   };
 
   // Load an existing home using its ID.
@@ -172,26 +312,24 @@ function HomePage() {
       return;
     }
 
-    setLoading(true);
+    await runExclusive(async () => {
+      try {
+        const loadedBalances = await apiRequest<BalancesResponse>(
+          `/homes/${encodeURIComponent(id)}/balances`,
+        );
 
-    try {
-      const loadedBalances = await apiRequest<BalancesResponse>(
-        `/homes/${id}/balances`,
-      );
+        resetHomeData();
+        setBalances(loadedBalances.balances ?? []);
+        setActiveHome({
+          id,
+          name: "Existing home",
+        });
 
-      resetHomeData();
-      setBalances(loadedBalances.balances ?? []);
-      setActiveHome({
-        id,
-        name: "Existing home",
-      });
-
-      setSuccess("Home balances loaded successfully.");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to load home.");
-    } finally {
-      setLoading(false);
-    }
+        setSuccess("Home balances loaded successfully.");
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Unable to load home.");
+      }
+    });
   };
 
   // POST /homes/:homeId/members
@@ -211,27 +349,46 @@ function HomePage() {
       return;
     }
 
-    setLoading(true);
-
-    try {
-      const member = await apiRequest<Member>(
-        `/homes/${activeHome.id}/members`,
-        {
-          method: "POST",
-          body: JSON.stringify({ name }),
-        },
-      );
-
-      setMembers((current) => [...current, member]);
-      setMemberName("");
-      setSuccess(`${member.name} was added successfully.`);
-
-      await loadBalances(activeHome.id);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to add member.");
-    } finally {
-      setLoading(false);
+    if (name.length > 100) {
+      setError("Member name must be 100 characters or fewer.");
+      return;
     }
+
+    const home = activeHome;
+    const session = sessionRef.current;
+
+    await runExclusive(async () => {
+      const scope = `member:${home.id}:${name.toLowerCase()}`;
+      const key = getMutationKey(scope);
+
+      try {
+        const member = await apiRequest<Member>(
+          `/homes/${home.id}/members`,
+          {
+            method: "POST",
+            headers: { "Idempotency-Key": key },
+            body: JSON.stringify({ name }),
+          },
+        );
+
+        mutationKeys.current.delete(scope);
+
+        if (session !== sessionRef.current) return;
+
+        setMembers((current) =>
+          current.some((item) => item.id === member.id)
+            ? current
+            : [...current, member],
+        );
+        setMemberName("");
+        setSuccess(`${member.name} was added successfully.`);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Unable to add member.");
+        return;
+      }
+
+      await refreshBalancesSafely(home.id, session);
+    });
   };
 
   // POST /homes/:homeId/bills
@@ -245,58 +402,93 @@ function HomePage() {
     }
 
     const title = billTitle.trim();
-    const amount = Number(billAmount);
 
     if (!title) {
       setError("Enter a bill title.");
       return;
     }
 
-    if (!Number.isFinite(amount) || amount <= 0) {
-      setError("Enter a valid bill amount.");
+    if (title.length > 120) {
+      setError("Bill title must be 120 characters or fewer.");
       return;
     }
 
-    const totalCents = Math.round(amount * 100);
+    const parsed = parseAmountToCents(billAmount);
 
-    setLoading(true);
+    if ("error" in parsed) {
+      setError(parsed.error);
+      return;
+    }
 
-    try {
-      const bill = await apiRequest<Bill>(
-        `/homes/${activeHome.id}/bills`,
-        {
+    // UX guard only. The backend must also reject bills for empty households.
+    if (balances.length === 0 && members.length === 0) {
+      setError("Add at least one member before creating a bill.");
+      return;
+    }
+
+    const totalCents = parsed.cents;
+    const home = activeHome;
+    const session = sessionRef.current;
+
+    await runExclusive(async () => {
+      const scope = `bill:${home.id}:${title.toLowerCase()}:${totalCents}`;
+      const key = getMutationKey(scope);
+
+      try {
+        const bill = await apiRequest<Bill>(`/homes/${home.id}/bills`, {
           method: "POST",
+          headers: { "Idempotency-Key": key },
           body: JSON.stringify({
             title,
             totalCents,
           }),
-        },
-      );
+        });
 
-      // The POST response contains the bill and its shares.
-      // Keep it in local state because a GET bills endpoint
-      // has not yet been confirmed.
-      setBills((current) => [bill, ...current]);
+        mutationKeys.current.delete(scope);
 
-      setBillTitle("");
-      setBillAmount("");
+        if (session !== sessionRef.current) return;
 
-      await loadBalances(activeHome.id);
+        // The POST response contains the bill and its shares.
+        // Keep it in local state because a GET bills endpoint
+        // has not yet been confirmed.
+        setBills((current) =>
+          current.some((item) => item.id === bill.id)
+            ? current
+            : [bill, ...current],
+        );
 
-      setSuccess("Bill created successfully.");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to create bill.");
-    } finally {
-      setLoading(false);
-    }
+        setBillTitle("");
+        setBillAmount("");
+        setSuccess("Bill created successfully.");
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Unable to create bill.");
+        return;
+      }
+
+      await refreshBalancesSafely(home.id, session);
+    });
   };
 
   // POST /bills/:billId/shares/:shareId/pay
   const payShare = async (billId: string, shareId: string) => {
     if (!activeHome) return;
 
+    // Synchronous duplicate-click guard.
+    if (inFlightPayments.current.has(shareId)) return;
+
+    // Already paid locally: nothing to do.
+    const alreadyPaid = bills
+      .find((bill) => bill.id === billId)
+      ?.shares.find((share) => share.id === shareId)?.paidAt;
+    if (alreadyPaid) return;
+
+    inFlightPayments.current.add(shareId);
+    setPayingShareIds((current) => new Set(current).add(shareId));
+
     clearMessages();
-    setPayingShareId(shareId);
+
+    const homeId = activeHome.id;
+    const session = sessionRef.current;
 
     let idempotencyKey = paymentKeys.current.get(shareId);
 
@@ -304,6 +496,8 @@ function HomePage() {
       idempotencyKey = `payment-${crypto.randomUUID()}`;
       paymentKeys.current.set(shareId, idempotencyKey);
     }
+
+    let paid = false;
 
     try {
       const updatedShare = await apiRequest<Share>(
@@ -316,29 +510,42 @@ function HomePage() {
         },
       );
 
-      setBills((current) =>
-        current.map((bill) =>
-          bill.id !== billId
-            ? bill
-            : {
-                ...bill,
-                shares: bill.shares.map((share) =>
-                  share.id === shareId ? updatedShare : share,
-                ),
-              },
-        ),
-      );
-
+      paid = true;
+      // Only drop the key once the server has confirmed the payment.
       paymentKeys.current.delete(shareId);
 
-      await loadBalances(activeHome.id);
+      if (session === sessionRef.current) {
+        setBills((current) =>
+          current.map((bill) =>
+            bill.id !== billId
+              ? bill
+              : {
+                  ...bill,
+                  shares: bill.shares.map((share) =>
+                    share.id === shareId ? updatedShare : share,
+                  ),
+                },
+          ),
+        );
 
-      setSuccess("Payment recorded successfully.");
+        setSuccess("Payment recorded successfully.");
+      }
     } catch (err) {
-      // Keep the key so a retry uses the same idempotency key.
-      setError(err instanceof Error ? err.message : "Payment failed.");
+      // Failure or timeout: keep the key so a retry is the SAME payment.
+      if (session === sessionRef.current) {
+        setError(err instanceof Error ? err.message : "Payment failed.");
+      }
     } finally {
-      setPayingShareId(null);
+      inFlightPayments.current.delete(shareId);
+      setPayingShareIds((current) => {
+        const next = new Set(current);
+        next.delete(shareId);
+        return next;
+      });
+    }
+
+    if (paid) {
+      await refreshBalancesSafely(homeId, session);
     }
   };
 
@@ -362,6 +569,8 @@ function HomePage() {
       ),
     0,
   );
+
+  const hasMembers = balances.length > 0 || members.length > 0;
 
   return (
     <main className="app-container">
@@ -399,6 +608,7 @@ function HomePage() {
           <input
             id="homeName"
             value={homeName}
+            maxLength={100}
             onChange={(event) => setHomeName(event.target.value)}
             placeholder="e.g. Michael's Apartment"
           />
@@ -438,20 +648,20 @@ function HomePage() {
               className="secondary-button"
               type="button"
               disabled={loading}
-              onClick={async () => {
-                clearMessages();
-                setLoading(true);
-                try {
-                  await loadBalances(activeHome.id);
-                  setSuccess("Balances refreshed.");
-                } catch (err) {
-                  setError(
-                    err instanceof Error ? err.message : "Refresh failed.",
-                  );
-                } finally {
-                  setLoading(false);
-                }
-              }}
+              onClick={() =>
+                runExclusive(async () => {
+                  clearMessages();
+                  const session = sessionRef.current;
+                  try {
+                    await loadBalances(activeHome.id, session);
+                    setSuccess("Balances refreshed.");
+                  } catch (err) {
+                    setError(
+                      err instanceof Error ? err.message : "Refresh failed.",
+                    );
+                  }
+                })
+              }
             >
               Refresh balances
             </button>
@@ -485,6 +695,7 @@ function HomePage() {
               <input
                 id="memberName"
                 value={memberName}
+                maxLength={100}
                 onChange={(event) => setMemberName(event.target.value)}
                 placeholder="e.g. Michael"
               />
@@ -509,13 +720,16 @@ function HomePage() {
             <form className="panel" onSubmit={createBill}>
               <h2>Create a bill</h2>
               <p className="muted">
-                The API will split the amount among the home's members.
+                {hasMembers
+                  ? "The API will split the amount among the home's members."
+                  : "Add at least one member before creating a bill."}
               </p>
 
               <label htmlFor="billTitle">Bill title</label>
               <input
                 id="billTitle"
                 value={billTitle}
+                maxLength={120}
                 onChange={(event) => setBillTitle(event.target.value)}
                 placeholder="e.g. November Electricity Bill"
               />
@@ -523,15 +737,14 @@ function HomePage() {
               <label htmlFor="billAmount">Total amount (₦)</label>
               <input
                 id="billAmount"
-                type="number"
-                min="0.01"
-                step="0.01"
+                type="text"
+                inputMode="decimal"
                 value={billAmount}
                 onChange={(event) => setBillAmount(event.target.value)}
                 placeholder="15000"
               />
 
-              <button disabled={loading} type="submit">
+              <button disabled={loading || !hasMembers} type="submit">
                 Create bill and split
               </button>
             </form>
@@ -659,6 +872,8 @@ function HomePage() {
                             localMember?.name ||
                             "Household member";
 
+                          const isPaying = payingShareIds.has(share.id);
+
                           return (
                             <div className="share-row" key={share.id}>
                               <div className="share-details">
@@ -674,14 +889,12 @@ function HomePage() {
                                 <button
                                   className="pay-button"
                                   type="button"
-                                  disabled={payingShareId === share.id}
+                                  disabled={isPaying}
                                   onClick={() =>
                                     payShare(bill.id, share.id)
                                   }
                                 >
-                                  {payingShareId === share.id
-                                    ? "Processing..."
-                                    : "Mark as paid"}
+                                  {isPaying ? "Processing..." : "Mark as paid"}
                                 </button>
                               )}
                             </div>

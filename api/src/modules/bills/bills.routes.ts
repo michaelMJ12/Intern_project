@@ -5,10 +5,15 @@ import { AppError } from "../../shared/errors";
 import { BillsRepository } from "./bills.repository";
 import { BillsService } from "./bills.service";
 import { validateCreateBill } from "./bills.schema";
+import { IdempotencyRepository, readIdempotencyKey } from "../../shared/idempotency";
 
 const billsRoutes = new Hono<{ Bindings: Env }>();
 
 billsRoutes.post("/:homeId/bills", async (c) => {
+  const idempotencyKey = readIdempotencyKey(
+    c.req.header("Idempotency-Key"),
+  );
+
   let body: unknown;
 
   try {
@@ -28,28 +33,32 @@ billsRoutes.post("/:homeId/bills", async (c) => {
     );
   }
 
+  const db = getDatabase(c);
+
   const service = new BillsService(
-    new BillsRepository(getDatabase(c)),
+    new BillsRepository(db),
+    new IdempotencyRepository(db),
   );
 
   const bill = await service.createBill(
     c.req.param("homeId"),
     input.title,
     input.totalCents,
+    idempotencyKey,
   );
 
   return c.json(bill, 201);
 });
 
-
 billsRoutes.get("/:homeId/bills", async (c) => {
+  const db = getDatabase(c);
+
   const service = new BillsService(
-    new BillsRepository(getDatabase(c)),
+    new BillsRepository(db),
+    new IdempotencyRepository(db),
   );
 
-  const bills = await service.getBills(
-    c.req.param("homeId"),
-  );
+  const bills = await service.getBills(c.req.param("homeId"));
 
   return c.json({ bills }, 200);
 });

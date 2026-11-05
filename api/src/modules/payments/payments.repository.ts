@@ -25,38 +25,30 @@ export class PaymentsRepository {
       .bind(billId, shareId)
       .first<BillShare>();
   }
-
   async markAsPaid(
+    billId: string,
     shareId: string,
     idempotencyKey: string,
     paidAt: string,
   ): Promise<BillShare | null> {
-    // This is an atomic conditional update.
-    await this.db
+    return this.db
       .prepare(
         `UPDATE bill_shares
          SET
            paid_at = ?,
            idempotency_key = ?
          WHERE id = ?
-           AND paid_at IS NULL`,
-      )
-      .bind(paidAt, idempotencyKey, shareId)
-      .run();
-
-    return this.db
-      .prepare(
-        `SELECT
+           AND bill_id = ?
+           AND paid_at IS NULL
+         RETURNING
            id,
            bill_id,
            member_id,
            amount_cents,
            paid_at,
-           idempotency_key
-         FROM bill_shares
-         WHERE id = ?`,
+           idempotency_key`,
       )
-      .bind(shareId)
+      .bind(paidAt, idempotencyKey, shareId, billId)
       .first<BillShare>();
   }
 }

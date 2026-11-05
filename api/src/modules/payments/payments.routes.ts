@@ -4,25 +4,21 @@ import { getDatabase } from "../../db/database";
 import { AppError } from "../../shared/errors";
 import { PaymentsRepository } from "./payments.repository";
 import { PaymentsService } from "./payments.service";
+import { readIdempotencyKey } from "../../shared/idempotency";
 
 const paymentsRoutes = new Hono<{ Bindings: Env }>();
 
 paymentsRoutes.post(
   "/:billId/shares/:shareId/pay",
   async (c) => {
-    const idempotencyKey = c.req.header("Idempotency-Key");
+    const idempotencyKey = readIdempotencyKey(
+      c.req.header("Idempotency-Key"),
+    );
 
-    if (!idempotencyKey?.trim()) {
+    if (!idempotencyKey) {
       throw new AppError(
         400,
         "Idempotency-Key header is required",
-      );
-    }
-
-    if (idempotencyKey.length > 255) {
-      throw new AppError(
-        400,
-        "Idempotency-Key is too long",
       );
     }
 

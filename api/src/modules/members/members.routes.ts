@@ -5,10 +5,15 @@ import { AppError } from "../../shared/errors";
 import { HomesRepository } from "../homes/homes.repository";
 import { MembersRepository } from "./members.repository";
 import { MembersService } from "./members.service";
+import { IdempotencyRepository, readIdempotencyKey } from "../../shared/idempotency";
 
 const membersRoutes = new Hono<{ Bindings: Env }>();
 
 membersRoutes.post("/:homeId/members", async (c) => {
+  const idempotencyKey = readIdempotencyKey(
+    c.req.header("Idempotency-Key"),
+  );
+
   let body: unknown;
 
   try {
@@ -32,11 +37,13 @@ membersRoutes.post("/:homeId/members", async (c) => {
   const service = new MembersService(
     new HomesRepository(db),
     new MembersRepository(db),
+    new IdempotencyRepository(db),
   );
 
   const member = await service.addMember(
     c.req.param("homeId"),
     body.name,
+    idempotencyKey,
   );
 
   return c.json(

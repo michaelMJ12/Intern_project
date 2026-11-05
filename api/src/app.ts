@@ -1,9 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-
 import type { Env } from "./config/env";
 import { errorHandler } from "./middleware/error-handler";
-
 import { homesRoutes } from "./modules/homes/homes.routes";
 import { membersRoutes } from "./modules/members/members.routes";
 import { billsRoutes } from "./modules/bills/bills.routes";
@@ -15,12 +13,13 @@ const app = new Hono<{ Bindings: Env }>();
 app.use(
   "/api/*",
   cors({
-    origin: ["http://localhost:5173"],
+    origin: (origin) =>
+      /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
+        ? origin
+        : null,
     allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: [
-      "Content-Type",
-      "Idempotency-Key",
-    ],
+    allowHeaders: ["Content-Type", "Idempotency-Key"],
+    maxAge: 86400,
   }),
 );
 
